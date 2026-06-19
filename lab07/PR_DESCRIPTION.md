@@ -10,9 +10,9 @@ Implements the full deployment pipeline for the lab07 service: supply chain secu
 
 | Area | File(s) | Notes |
 |------|---------|-------|
-| **SBOM** | `sbom.json` / `sbom.spdx` | Generated via `syft`; pinned to current dependency snapshot |
-| **Pipeline YAML** | `.github/workflows/deploy.yml` | Stages: build → scan → validate-iac → manual-approval → deploy |
-| **IaC** | `infra/main.bicep` or `infra/main.tf` | Copilot-generated; pre-flight validated with `azure-deployment-preflight` skill |
+| **SBOM** | `lab07/sbom.xml` | Generated via `cyclonedx-bom` (`cyclonedx-py`) from `lab07/requirements.txt` |
+| **Pipeline YAML** | `.github/workflows/lab07-pipeline.yml` | Stages: build → scan → validate-iac → manual-approval → deploy |
+| **IaC** | `lab07/main.bicep` or `lab07/main.tf` | Optional — validated by the pipeline when present |
 
 ---
 
