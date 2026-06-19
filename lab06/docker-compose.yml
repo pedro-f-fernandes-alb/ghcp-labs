@@ -1,0 +1,165 @@
+# =============================================================================
+# docker-compose.yml — Reminder Engine + PostgreSQL
+# Production-ready configuration following Docker best practices:
+#   - Custom bridge network for isolated service-to-service communication
+#   - Named volumes for data persistence across container restarts
+#   - Health checks with start-up grace periods on both services
+#   - Non-root users defined in each service image
+#   - Secrets and sensitive values supplied via environment variables
+#   - Resource limits to prevent noisy-neighbour problems
+#   - Restart policies for self-healing behaviour
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # reminder-engine
+  # The Python scheduler that evaluates pending approvals and dispatches
+  # reminders.  It reads its database DSN and policy tuning from env vars so
+  # the same image can be promoted through dev → staging → production without
+  # rebuilding.
+  # ---------------------------------------------------------------------------
+  reminder-engine:
+    build:
+      context: .                        # Dockerfile must live in lab06/
+      dockerfile: Dockerfile
+      target: production                # use the final multi-stage target
+    image: ghcp-labs/reminder-engine:latest
+
+    # Environment variables — override with a .env file or CI secrets in
+    # production; NEVER commit real credentials to source control.
+    environment:
+      # ── Database connection ──────────────────────────────────────────────
+      DB_HOST: postgres                 # service name resolves via bridge network
+      DB_PORT: "5432"
+      DB_NAME: ${POSTGRES_DB:-reminders}
+      DB_USER: ${POSTGRES_USER:-reminder_user}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?DB password must be set}  # fails fast if missing
+
+      # ── Reminder policy (maps to ReminderPolicy dataclass) ───────────────
+      REMINDER_THRESHOLD_HOURS: ${REMINDER_THRESHOLD_HOURS:-48}
+      REMINDER_COOLDOWN_HOURS: ${REMINDER_COOLDOWN_HOURS:-24}
+
+      # ── Application settings ─────────────────────────────────────────────
+      APP_ENV: ${APP_ENV:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      PYTHONUNBUFFERED: "1"             # ensure logs reach stdout immediately
+
+    # Only start after the database is healthy (requires healthcheck below)
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    # Restart on any failure, but give up after sustained instability so an
+    # alert fires rather than silently looping.
+    restart: unless-stopped
+
+    # Health check — verifies the engine process is still responsive.
+    # Adjust the CMD to match your actual health-check endpoint or script.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import reminder_engine; print('ok')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s   # allow time for DB connection pool warm-up
+      retries: 3
+
+    # Resource limits — tune to match your host capacity.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+        reservations:
+          cpus: "0.10"
+          memory: 64M
+
+    # Mount source code as read-only so the container cannot modify it at
+    # runtime.  Remove this bind-mount in CI and rely solely on the built image.
+    volumes:
+      - ./:/app:ro                      # source code (read-only)
+      - engine_logs:/app/logs           # writable log directory
+
+    networks:
+      - reminder_net
+
+    # Propagate meaningful exit codes to the orchestrator
+    stop_grace_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # postgres
+  # Persistent relational store for approval records and reminder audit logs.
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine           # pinned major version; minimal Alpine variant
+
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-reminders}
+      POSTGRES_USER: ${POSTGRES_USER:-reminder_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?DB password must be set}
+
+      # Tune Postgres to the resource limits below
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+
+    # Health check — postgres is healthy only when it can accept queries.
+    # Using pg_isready avoids starting the engine before Postgres is ready.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-reminder_user} -d ${POSTGRES_DB:-reminders}"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s   # Postgres can take time on first boot (initdb)
+      retries: 5
+
+    restart: unless-stopped
+
+    deploy:
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+
+    volumes:
+      # Named volume — data survives container replacement and upgrades
+      - postgres_data:/var/lib/postgresql/data
+      # Optional: place *.sql init scripts here to seed the schema on first run
+      # - ./db/init:/docker-entrypoint-initdb.d:ro
+
+    networks:
+      - reminder_net
+
+    # Never expose the database port to the host in production.
+    # Uncomment the line below only for local development / debugging.
+    # ports:
+    #   - "127.0.0.1:5432:5432"
+
+    stop_grace_period: 30s              # allow in-flight transactions to complete
+
+# =============================================================================
+# Named volumes
+# Docker manages lifecycle independently of the containers.  Data persists
+# through `docker compose up/down` cycles; only `docker compose down -v`
+# will remove it.
+# =============================================================================
+volumes:
+  postgres_data:
+    driver: local
+  engine_logs:
+    driver: local
+
+# =============================================================================
+# Networks
+# A dedicated bridge network provides:
+#   - Automatic DNS resolution by service name (e.g. "postgres")
+#   - Isolation from other Compose projects on the same host
+#   - No unintended exposure to the default bridge
+# =============================================================================
+networks:
+  reminder_net:
+    driver: bridge
+    # Assign an explicit subnet to avoid collisions in environments with
+    # many Compose stacks.  Adjust the range to fit your infrastructure.
+    ipam:
+      config:
+        - subnet: "172.28.0.0/16"

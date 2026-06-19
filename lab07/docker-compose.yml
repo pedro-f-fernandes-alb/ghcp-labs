@@ -1,0 +1,129 @@
+# =============================================================================
+# docker-compose.yml — Reminder Engine (lab07)
+#
+# Services:
+#   db       — PostgreSQL 16 database for approval and reminder records
+#   app      — Python reminder engine scheduler
+#
+# Usage:
+#   docker compose up -d          # start in detached mode
+#   docker compose logs -f app    # follow app logs
+#   docker compose down -v        # stop and remove volumes
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL database service
+  # Stores approval requests, reminder attempts, and scheduler run results.
+  # ---------------------------------------------------------------------------
+  db:
+    image: postgres:16-alpine
+    container_name: reminder_db
+
+    # Credentials and database name are sourced from environment variables.
+    # In production, supply these via a .env file or a secrets manager —
+    # never hard-code passwords in version-controlled files.
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-reminder_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: ${POSTGRES_DB:-reminder_db}
+
+    # Persist database files across container restarts.
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Optional: mount an init SQL script to create the schema on first boot.
+      # - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
+    # Expose the port only on localhost to prevent unintended external access.
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
+
+    networks:
+      - reminder_net
+
+    # Restart automatically unless explicitly stopped.
+    restart: unless-stopped
+
+    # Health check: verify PostgreSQL is ready to accept connections.
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-reminder_user} -d ${POSTGRES_DB:-reminder_db}"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # Reminder engine application service
+  # Runs the scheduler cycle that detects stale approvals and sends reminders.
+  # ---------------------------------------------------------------------------
+  app:
+    build:
+      context: ..        # build from the repo root so lab06 source is reachable
+      dockerfile: lab07/Dockerfile
+    container_name: reminder_app
+
+    # Database connection string and reminder-policy tunables.
+    environment:
+      # Full DSN constructed from individual credential variables so no single
+      # variable exposes the password in plain sight in process listings.
+      DATABASE_URL: >-
+        postgresql://${POSTGRES_USER:-reminder_user}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@db:5432/${POSTGRES_DB:-reminder_db}
+
+      # Reminder policy (override in .env as needed).
+      REMINDER_THRESHOLD_HOURS: ${REMINDER_THRESHOLD_HOURS:-48}
+      REMINDER_COOLDOWN_HOURS: ${REMINDER_COOLDOWN_HOURS:-24}
+
+      # Scheduler interval in seconds between each run cycle.
+      SCHEDULER_INTERVAL_SECONDS: ${SCHEDULER_INTERVAL_SECONDS:-300}
+
+      # Python log level: DEBUG | INFO | WARNING | ERROR | CRITICAL
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+    # Mount the source directory so code changes are reflected without rebuild
+    # during development.  Remove this volume in a strictly immutable prod image.
+    volumes:
+      - ../lab06:/app/lab06:ro
+
+    networks:
+      - reminder_net
+
+    # The app must not start before the database is healthy.
+    depends_on:
+      db:
+        condition: service_healthy
+
+    restart: unless-stopped
+
+    # Health check: verify the Python process is still running by checking
+    # whether the scheduler PID file exists (written by the entrypoint).
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/scheduler.pid && kill -0 $(cat /tmp/scheduler.pid) 2>/dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+# =============================================================================
+# Named volumes
+# =============================================================================
+volumes:
+  # Postgres data directory — survives container recreation.
+  postgres_data:
+    driver: local
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  # Custom bridge network provides DNS-based service discovery (db, app) and
+  # isolates these containers from other Docker networks on the host.
+  reminder_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
