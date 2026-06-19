@@ -26,7 +26,7 @@ jobs:
 
       - name: Run tests with coverage gate
         run: |
-          pytest tests/ \
+          PYTHONPATH=. pytest solutions/ \
             --cov=order_processor \
             --cov-report=term-missing \
             --cov-fail-under=80 \
